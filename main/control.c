@@ -96,9 +96,9 @@ static void control_task(void *arg)
         float lpm     = flow_read_lpm();
         bool  flowing = lpm >= FLOW_MIN_LPM;
 
-        /* The tank node's own verdict on the tank: full, partial,
-         * refillable, or nothing usable. Both thresholds behind it live
-         * over there, with the sensor. */
+        /* The tank node's own verdict on the tank: full, not full, or
+         * nothing usable. The threshold behind it lives over there,
+         * with the sensor. It can only ever stop this pump. */
         tank_state_t tank    = TANK_UNKNOWN;
         bool         tank_ok = telemetry_tank_state_get(&tank);
 
@@ -127,25 +127,38 @@ static void control_task(void *arg)
         switch (state) {
 
         case ST_IDLE:
-            /* Start only on confirmed inflow and a tank the node calls
-             * refillable. A tank state that is merely not full is not
-             * enough: refillable is the far side of the hysteresis
-             * band, and starting inside the band makes the relay
-             * chatter as the water surface moves. An unusable tank
-             * state is never a reason to start either. */
+            /* Confirmed inflow is the only thing that starts this pump.
+             * The tank level does not start it and never did anything
+             * but stop it: water arriving in the pipeline is the whole
+             * reason to run, and a tank that has drained is not, on its
+             * own, water to pump.
+             *
+             * The tank still gets a veto. A tank the node last called
+             * full has nowhere to put what the pipeline is delivering,
+             * so starting into it would close the relay and open it
+             * again on the next cycle with tank_full. Blocking is not
+             * starting: flow remains the only trigger.
+             *
+             * A state that is merely stale does not block a start —
+             * flow is the trigger, and a link that stays quiet trips
+             * the fault below within TANK_FAULT_LIMIT cycles anyway. */
             if (tank_faults >= TANK_FAULT_LIMIT) {
                 next   = ST_FAULT;
                 reason = "sensor_fault";
-            } else if (tank_ok &&
-                       flow_ok_since != 0 &&
+            } else if (flow_ok_since != 0 &&
                        (now_ms - flow_ok_since) >= FLOW_CONFIRM_MS &&
-                       tank == TANK_REFILLABLE) {
+                       tank != TANK_FULL) {
                 next   = ST_PUMPING;
                 reason = "flow_confirmed";
             }
             break;
 
         case ST_PUMPING:
+            /* Two things stop a running pump: the tank filling up, and
+             * the pipeline running dry. The rest of this branch is
+             * guards, not control — a tank node that has gone quiet
+             * cannot tell us the tank filled, and MAX_RUN_MS is a
+             * runaway cutoff for a pump that neither ever reports. */
             if (tank_faults >= TANK_FAULT_LIMIT) {
                 next   = ST_FAULT;
                 reason = "sensor_fault";

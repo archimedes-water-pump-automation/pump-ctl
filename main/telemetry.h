@@ -3,17 +3,17 @@
 #include <stdbool.h>
 
 /* What the tank node reports about the tank. This controller receives
- * the state, never the distance behind it: both thresholds live in the
- * tank node's config, with the sensor that produces the reading they
- * are applied to. See MQTT_CONTRACT.md.
+ * the state, never the distance behind it: the threshold lives in the
+ * tank node's config, with the sensor that produces the reading it is
+ * applied to. See MQTT_CONTRACT.md.
  *
- * TANK_PARTIAL is the hysteresis band between them, where a running
- * pump keeps running and an idle one stays idle. */
+ * The tank answers one question, and only ever stops the pump with it.
+ * Nothing about the tank starts a pump: that is the flow sensor's job
+ * alone, so a falling level is not a state this controller acts on. */
 typedef enum {
-    TANK_UNKNOWN,    /* no usable reading; never means room in the tank */
-    TANK_FULL,       /* nowhere to put water: stop pumping             */
-    TANK_PARTIAL,    /* inside the hysteresis band: no transition      */
-    TANK_REFILLABLE  /* low enough to start again                      */
+    TANK_UNKNOWN,   /* no usable reading; never means room in the tank */
+    TANK_FULL,      /* nowhere to put water: stop pumping             */
+    TANK_NOT_FULL   /* room left; on its own, never a reason to pump  */
 } tank_state_t;
 
 void telemetry_start(void);

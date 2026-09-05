@@ -166,10 +166,9 @@ void telemetry_publish_turn_off(const char *reason)
 const char *tank_state_name(tank_state_t state)
 {
     switch (state) {
-        case TANK_FULL:       return "full";
-        case TANK_PARTIAL:    return "partial";
-        case TANK_REFILLABLE: return "refillable";
-        default:              return "unknown";
+        case TANK_FULL:     return "full";
+        case TANK_NOT_FULL: return "not_full";
+        default:            return "unknown";
     }
 }
 
@@ -207,11 +206,8 @@ static tank_state_t tank_state_from_name(const char *name)
     if (strcmp(name, "full") == 0) {
         return TANK_FULL;
     }
-    if (strcmp(name, "partial") == 0) {
-        return TANK_PARTIAL;
-    }
-    if (strcmp(name, "refillable") == 0) {
-        return TANK_REFILLABLE;
+    if (strcmp(name, "not_full") == 0) {
+        return TANK_NOT_FULL;
     }
     return TANK_UNKNOWN;
 }
@@ -222,8 +218,8 @@ static tank_state_t tank_state_from_name(const char *name)
  *   {"event":"full_tank","device":"tank-01","timestamp":"...",
  *    "state":"full","uptime_s":360}
  *
- * There is no distance in it, by design: the tank node owns both
- * thresholds, so there is nothing here to re-derive with a copy of them
+ * There is no distance in it, by design: the tank node owns the
+ * threshold, so there is nothing here to re-derive with a copy of it
  * that has drifted. Anything that fails a check is recorded as
  * TANK_UNKNOWN, which the control loop treats as a fault. It is never
  * recorded as room in the tank. */

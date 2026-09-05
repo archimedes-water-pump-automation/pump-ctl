@@ -99,12 +99,12 @@ a tank that overflows.
 
 | Field | Type | Required | Meaning |
 |---|---|---|---|
-| `state` | string | yes | `"full"`, `"partial"`, `"refillable"`, or `"unknown"`. |
+| `state` | string | yes | `"full"`, `"not_full"`, or `"unknown"`. |
 | `reason` | string | when `state` is `"unknown"` | `"sensor_unreadable"` (fewer than 3 good pings) or `"node_offline"` (last will). |
 
 ```json
 {"event":"full_tank","device":"tank-01","timestamp":"2026-09-05T03:10:12Z",
- "state":"refillable","uptime_s":360}
+ "state":"not_full","uptime_s":360}
 ```
 
 Last will, published by the broker if the node drops off uncleanly:
@@ -114,31 +114,33 @@ Last will, published by the broker if the node drops off uncleanly:
  "reason":"node_offline"}
 ```
 
-**There is no distance on this topic, deliberately.** The thresholds that turn
-a distance into a state — `DIST_FULL_CM` and `DIST_REFILL_CM` — live in
-`tank-node`'s config, beside the sensor that produces the distance. A
-controller that also saw the raw reading could apply a second copy of those
-thresholds, free to drift from the ones actually deciding, with no way to tell
-which copy had drifted.
+**There is no distance on this topic, deliberately.** The threshold that turns
+a distance into a state — `DIST_FULL_CM` — lives in `tank-node`'s config,
+beside the sensor that produces the distance. A controller that also saw the
+raw reading could apply a second copy of that threshold, free to drift from
+the one actually deciding, with no way to tell which copy had drifted.
 
-The four states, and what `pump-ctl` does with each:
+**This topic can only ever stop the pump.** Nothing about the tank starts it:
+`pump-ctl` starts on confirmed inflow at its flow sensor and on nothing else,
+so a level that has dropped is not a state anyone reports or acts on. That is
+why the tank answers one question rather than reporting where the water is.
 
-| State | Means | Pump |
+| State | Means | Effect on the pump |
 |---|---|---|
-| `full` | `distance_cm <= DIST_FULL_CM`: nowhere left to put water | Stops, with reason `tank_full`, and releases the supply valve |
-| `partial` | Between the two thresholds | No transition: a running pump keeps running, an idle one stays idle |
-| `refillable` | `distance_cm >= DIST_REFILL_CM`: low enough to fill again | May start, once inflow is confirmed |
+| `full` | `distance_cm <= DIST_FULL_CM`: nowhere left to put water | Running: stops, with reason `tank_full`, and releases the supply valve. Idle: blocks a start that flow would otherwise make |
+| `not_full` | There is room | Nothing on its own. A start still needs confirmed inflow |
 | `unknown` | The node could not read its sensor, or has dropped off | Fault: the pump is held off |
 
-Two thresholds rather than one, because a single one makes the relay chatter
-as the water surface moves across it. `partial` is that gap made explicit: a
-state that is merely "not full" is not enough to start a pump.
+`full` blocking a start is not the tank starting or gating the pump on a
+level: flow is still the only trigger, and the block only avoids closing the
+relay onto a tank that would stop it again on the next control cycle.
 
 `unknown` is never room in the tank, and neither is silence. `pump-ctl` faults
 after `TANK_FAULT_LIMIT` consecutive cycles without a usable state, and a
 message older than `TANK_STALE_MS` (20 s, four missed publishes) is not a
 usable state. Publishing every cycle rather than only on a change is what
-makes that silence detectable.
+makes that silence detectable. A node that has gone quiet cannot report a full
+tank, which is the one thing that stops a running pump in time.
 
 ### `watertank/pump-01/pump`
 
@@ -153,12 +155,12 @@ should learn what the pump is doing now.
 | `state` | string | yes | `"on"`, `"off"`, or `"unknown"` (last will only). |
 | `reason` | string | yes | What caused the transition. `"flow_confirmed"` for a start; `"tank_full"`, `"pipeline_dry"`, `"max_runtime"`, `"sensor_fault"`, `"lockout_expired"`, `"sensor_recovered"` or `"boot"` for a stop; `"controller_offline"` in the last will. |
 | `flow_lpm` | number | no | Pipeline inflow at the moment of the transition. Absent in the last will. |
-| `tank_state` | string | no | The tank node's last word on the tank when the relay moved — one of the four states above. Carried for diagnosis; absent in the last will. `pump-ctl` never sees a distance, so it cannot report one. |
+| `tank_state` | string | no | The tank node's last word on the tank when the relay moved — one of the three states above. Carried for diagnosis; absent in the last will. `pump-ctl` never sees a distance, so it cannot report one. |
 
 ```json
 {"event":"pump","device":"pump-01","timestamp":"2026-09-05T03:10:12Z",
  "state":"on","reason":"flow_confirmed","flow_lpm":11.40,
- "tank_state":"refillable","uptime_s":338}
+ "tank_state":"not_full","uptime_s":338}
 ```
 
 Last will:
@@ -245,7 +247,7 @@ scheduled-valve ──opens valve on schedule (trial)──▶ pipeline
         │                                          pump-ctl
         └──────────────────────────────────────────┘  │   ▲
                                                       │   │ watertank/tank-01/full_tank
-                       watertank/pump-01/pump         │   │ {"state":"refillable"|"full"|…}
+                       watertank/pump-01/pump         │   │ {"state":"full"|"not_full"|…}
                        {"state":"on"|"off"}           ▼   │
                                             archimedes-server
                                               (PostgreSQL)
@@ -253,17 +255,20 @@ scheduled-valve ──opens valve on schedule (trial)──▶ pipeline
    tank-node ──┬──watertank/tank-01/level─────────────┘
                │  {"valid":true,"distance_cm":62.5}
                └──watertank/tank-01/full_tank──▶ pump-ctl
-                  {"state":"refillable"}
+                  {"state":"full"|"not_full"}
 ```
 
 1. `scheduled-valve` opens the supply valve on its schedule and starts a
    trial window.
-2. Water reaches the pipeline; `pump-ctl`'s flow sensor confirms inflow, and
-   the tank node last called the tank `refillable`, so it publishes
-   `keep_open`, starts the pump, and publishes `state: "on"`.
+2. Water reaches the pipeline. `pump-ctl`'s flow sensor confirms inflow —
+   the only thing that starts its pump — so it publishes `keep_open`, starts
+   the pump, and publishes `state: "on"`. A tank the node last called `full`
+   is the one thing that holds that start back.
 3. `tank-node` takes a reading every 5 s and publishes it twice: the distance
    to `archimedes-server`, which stores it as a volume, and the state derived
    from it to `pump-ctl`, which acts on it.
-4. The tank reaches `full`, or the pipeline runs dry: `pump-ctl` stops the
-   pump, publishes `state: "off"` with the reason, and publishes `turn_off`
-   so the activator shuts the valve.
+4. The tank reaches `full`, or the pipeline runs dry: those two stop the
+   pump. `pump-ctl` publishes `state: "off"` with the reason and `turn_off`
+   so the activator shuts the valve. A tank node that goes quiet stops it
+   too, as a fail-safe rather than as a control input — silence cannot
+   report a full tank.
