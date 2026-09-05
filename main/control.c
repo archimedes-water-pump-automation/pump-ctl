@@ -116,6 +116,12 @@ static void control_task(void *arg)
 
         pump_state_t next = state;
 
+        /* Set alongside a stop reason that means the pipeline is no
+         * longer wanted open. The other stops are this controller's own
+         * limits and it expects to resume shortly, so they leave the
+         * supply where it is. */
+        bool release_supply = false;
+
         switch (state) {
 
         case ST_IDLE:
@@ -138,13 +144,15 @@ static void control_task(void *arg)
                 next   = ST_FAULT;
                 reason = "sensor_fault";
             } else if (level_ok && dist_cm <= DIST_FULL_CM) {
-                next   = ST_LOCKOUT;
-                reason = "tank_full";
+                next            = ST_LOCKOUT;
+                reason          = "tank_full";
+                release_supply  = true;   /* nowhere left to put water */
             } else if ((now_ms - state_since_ms) >= DRY_GRACE_MS &&
                        dry_since != 0 &&
                        (now_ms - dry_since) >= DRY_CONFIRM_MS) {
-                next   = ST_LOCKOUT;
-                reason = "pipeline_dry";
+                next            = ST_LOCKOUT;
+                reason          = "pipeline_dry";
+                release_supply  = true;   /* nothing coming down the pipe */
             } else if ((now_ms - state_since_ms) >= MAX_RUN_MS) {
                 next   = ST_LOCKOUT;
                 reason = "max_runtime";
@@ -172,14 +180,39 @@ static void control_task(void *arg)
             state_since_ms = now_ms;
             ESP_LOGI(TAG, "-> %s (%s)", state_name(state), reason);
 
-            /* The relay moves first. Telemetry is reported after the
-             * physical action, never as a precondition for it. */
             bool want_pump = (state == ST_PUMPING);
             if (want_pump != pump_on) {
+                /* Confirmed inflow means the upstream valve is inside
+                 * its trial window and will shut again on its own
+                 * unless it hears keep_open. Send it before the relay
+                 * closes, so the valve is held open before the pump
+                 * starts drawing on the pipeline.
+                 *
+                 * This does not weaken "the relay moves first": the
+                 * publish enqueues and is a no-op while offline, so it
+                 * can neither block the control task nor become a
+                 * precondition for the physical action. If it is lost,
+                 * the valve times out, the pipeline goes dry and the
+                 * existing dry cutoff stops the pump. */
+                if (want_pump) {
+                    telemetry_publish_keep_open();
+                }
+
+                /* The relay moves before telemetry. Reporting follows
+                 * the physical action, never gates it. */
                 pump_on = want_pump;
                 relay_write(pump_on);
                 telemetry_publish_pump(pump_on, reason, lpm,
                                        dist_cm, level_ok);
+
+                /* Release the valve only once the pump is already off.
+                 * It feeds the pipeline this pump draws on, so shutting
+                 * it first would run the pump dry. Nothing is lost if
+                 * this one goes missing either: the activator closes on
+                 * its own runaway guard. */
+                if (!want_pump && release_supply) {
+                    telemetry_publish_turn_off();
+                }
             }
         }
 

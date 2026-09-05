@@ -12,6 +12,13 @@ The pump starts only when inflow from the pipeline is confirmed and the tank
 has room. It stops when the tank is full, when the pipeline goes dry, or when
 any safety limit trips.
 
+Inflow comes from the upstream valve driven by
+[`scheduled-valve`](../scheduled-valve), which opens on a schedule and closes
+again unless it is told to stay open. So the start transition also publishes a
+`keep_open` event for that module, before the relay closes, and a stop on
+`tank_full` or `pipeline_dry` publishes `turn_off` once the relay has opened.
+See [MQTT contract](#mqtt-contract).
+
 | State | Meaning |
 |---|---|
 | `idle` | Waiting for flow and a low enough tank |
@@ -41,6 +48,17 @@ are here:
 - **Telemetry cannot block control.** Publishes use `esp_mqtt_client_enqueue`
   and are no-ops while offline. An unreachable broker costs log lines, not
   pump behaviour.
+- **`keep_open` goes out before the relay closes,** but still cannot gate it.
+  It is a command to the upstream valve rather than telemetry, so it is
+  ordered ahead of the physical action; being an enqueue that no-ops while
+  offline, it can neither block nor prevent that action. A lost `keep_open`
+  is not a hazard: the valve times out, the pipeline goes dry and the existing
+  dry cutoff stops the pump.
+- **`turn_off` goes out after the relay opens,** the opposite order and for
+  the same reason. The valve feeds the pipeline this pump draws on, so
+  shutting it while the pump still runs would run the pump dry. A lost
+  `turn_off` is not a hazard either: the valve closes on its own `MAX_HOLD_MS`
+  runaway guard.
 
 ## Hardware
 
@@ -94,6 +112,36 @@ pump transition:
 Last will on the same topic sets `"state":"unknown"` so a dashboard cannot
 show `on` indefinitely for a controller that has lost power.
 
+**Publishes** to `watertank/activator-01/cmd` — QoS 1, **not retained**:
+
+```json
+{"command":"keep_open"}       {"command":"turn_off"}
+```
+
+Shared with [`scheduled-valve`](../scheduled-valve), which owns that topic.
+That module opens the supply valve on its own schedule and shuts it again
+unless a `keep_open` reaches it inside its trial window
+(`KEEP_OPEN_WINDOW_MS`, two minutes by default); once held, it stays open
+until `turn_off` or its own `MAX_HOLD_MS` guard.
+
+| Event | Sent when | Ordering |
+|---|---|---|
+| `keep_open` | `idle → pumping`, inflow confirmed and the tank has room | **before** the relay closes |
+| `turn_off` | pump stops with `tank_full` or `pipeline_dry` | **after** the relay opens |
+
+The two orderings are deliberate and opposite: the valve must be held open
+before the pump starts drawing on the pipeline, and must not be shut until
+after the pump has stopped drawing on it.
+
+`turn_off` is sent only for the two stops that mean the supply is no longer
+wanted — the tank has nowhere to put more water, or there is nothing coming
+down the pipe. `max_runtime` and `sensor_fault` are this controller's own
+limits and it expects to resume, so they leave the valve as it is.
+
+Never publish either retained. Each event authorises one specific moment; a
+retained copy replays on every reconnect and would act with nothing behind it.
+The activator rejects retained commands for the same reason.
+
 ## Configuration
 
 All tunables are in `main/config.h`.
@@ -128,6 +176,10 @@ Roughly 30–40 s from power-on to ready. This is the fail-safe working.
 
 ## Known gaps
 
+- A pump stop on `max_runtime` or `sensor_fault` sends no `turn_off`, on the
+  assumption that pumping resumes shortly. If it does not — a level sensor
+  that never recovers, say — the valve holds open until the activator's own
+  `MAX_HOLD_MS` guard expires, four hours by default.
 - Credentials are compiled in. Move to NVS before deployment.
 - Plaintext MQTT. Switch to `mqtts://` with a CA certificate — an
   unauthenticated broker is an unauthenticated switch for a mains pump.

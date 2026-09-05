@@ -51,3 +51,23 @@
 
 #define TOPIC_PUMP  "watertank/" DEVICE_ID "/pump"
 #define TOPIC_LEVEL "watertank/tank-01/level"   /* subscribed, not published */
+
+/* ======================= upstream activator ======================= */
+
+/* The scheduled-valve module opens the supply valve on its own
+ * schedule and shuts it again unless a keep_open event reaches it
+ * inside its trial window. This controller sends that event once
+ * inflow is confirmed, so the valve keeps feeding the pipeline the
+ * pump is about to draw on.
+ *
+ * The reverse event, turn_off, releases that hold once the tank is
+ * full or the pipeline has gone dry, rather than leaving the valve to
+ * sit open until the activator's own four-hour runaway guard.
+ *
+ * Its command topic is the only thing shared with that module. Both
+ * events are published QoS 1 and never retained: each authorises one
+ * specific moment, and a retained copy would replay on every reconnect
+ * and act with nothing behind it. */
+#define ACTIVATOR_ID "activator-01"
+
+#define TOPIC_ACTIVATOR_CMD "watertank/" ACTIVATOR_ID "/cmd"   /* published */
