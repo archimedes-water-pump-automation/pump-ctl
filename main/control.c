@@ -64,7 +64,7 @@ typedef enum {
     ST_IDLE,      /* waiting for flow and a low enough tank */
     ST_PUMPING,
     ST_LOCKOUT,   /* just stopped, cooling down             */
-    ST_FAULT      /* level sensor unusable, pump held off   */
+    ST_FAULT      /* tank state unusable, pump held off     */
 } pump_state_t;
 
 static const char *state_name(pump_state_t s)
@@ -88,7 +88,7 @@ static void control_task(void *arg)
     int64_t state_since_ms = esp_timer_get_time() / 1000;
     int64_t flow_ok_since  = 0;   /* 0 == not currently flowing */
     int64_t dry_since      = 0;   /* 0 == not currently dry     */
-    int     level_faults   = 0;
+    int     tank_faults    = 0;
 
     for (;;) {
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -96,13 +96,16 @@ static void control_task(void *arg)
         float lpm     = flow_read_lpm();
         bool  flowing = lpm >= FLOW_MIN_LPM;
 
-        float dist_cm  = 0.0f;
-        bool  level_ok = telemetry_level_get(&dist_cm);
+        /* The tank node's own verdict on the tank: full, partial,
+         * refillable, or nothing usable. Both thresholds behind it live
+         * over there, with the sensor. */
+        tank_state_t tank    = TANK_UNKNOWN;
+        bool         tank_ok = telemetry_tank_state_get(&tank);
 
-        if (level_ok) {
-            level_faults = 0;
-        } else if (level_faults < LEVEL_FAULT_LIMIT) {
-            level_faults++;
+        if (tank_ok) {
+            tank_faults = 0;
+        } else if (tank_faults < TANK_FAULT_LIMIT) {
+            tank_faults++;
         }
 
         if (flowing) {
@@ -124,25 +127,29 @@ static void control_task(void *arg)
         switch (state) {
 
         case ST_IDLE:
-            /* Start only on confirmed inflow and a tank with room in it.
-             * An unreadable level sensor is never a reason to start. */
-            if (level_faults >= LEVEL_FAULT_LIMIT) {
+            /* Start only on confirmed inflow and a tank the node calls
+             * refillable. A tank state that is merely not full is not
+             * enough: refillable is the far side of the hysteresis
+             * band, and starting inside the band makes the relay
+             * chatter as the water surface moves. An unusable tank
+             * state is never a reason to start either. */
+            if (tank_faults >= TANK_FAULT_LIMIT) {
                 next   = ST_FAULT;
                 reason = "sensor_fault";
-            } else if (level_ok &&
+            } else if (tank_ok &&
                        flow_ok_since != 0 &&
                        (now_ms - flow_ok_since) >= FLOW_CONFIRM_MS &&
-                       dist_cm >= DIST_REFILL_CM) {
+                       tank == TANK_REFILLABLE) {
                 next   = ST_PUMPING;
                 reason = "flow_confirmed";
             }
             break;
 
         case ST_PUMPING:
-            if (level_faults >= LEVEL_FAULT_LIMIT) {
+            if (tank_faults >= TANK_FAULT_LIMIT) {
                 next   = ST_FAULT;
                 reason = "sensor_fault";
-            } else if (level_ok && dist_cm <= DIST_FULL_CM) {
+            } else if (tank_ok && tank == TANK_FULL) {
                 next            = ST_LOCKOUT;
                 reason          = "tank_full";
                 release_supply  = true;   /* nowhere left to put water */
@@ -166,8 +173,8 @@ static void control_task(void *arg)
             break;
 
         case ST_FAULT:
-            /* Recovers on its own once the sensor reads again. */
-            if (level_ok) {
+            /* Recovers on its own once the tank node reports again. */
+            if (tank_ok) {
                 next   = ST_LOCKOUT;
                 reason = "sensor_recovered";
             }
@@ -177,7 +184,8 @@ static void control_task(void *arg)
         if (next != state) {
             state          = next;
             state_since_ms = now_ms;
-            ESP_LOGI(TAG, "-> %s (%s)", state_name(state), reason);
+            ESP_LOGI(TAG, "-> %s (%s), tank %s",
+                     state_name(state), reason, tank_state_name(tank));
 
             bool want_pump = (state == ST_PUMPING);
             if (want_pump != pump_on) {
@@ -201,8 +209,7 @@ static void control_task(void *arg)
                  * the physical action, never gates it. */
                 pump_on = want_pump;
                 relay_write(pump_on);
-                telemetry_publish_pump(pump_on, reason, lpm,
-                                       dist_cm, level_ok);
+                telemetry_publish_pump(pump_on, reason, lpm, tank);
 
                 /* Release the valve only once the pump is already off.
                  * It feeds the pipeline this pump draws on, so shutting

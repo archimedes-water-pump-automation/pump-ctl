@@ -3,14 +3,17 @@
 ESP32 firmware that switches a water pump based on pipeline inflow and tank
 level, and reports state over MQTT.
 
-The tank level is **not** measured locally. It arrives over MQTT from
-[`tank-node`](../tank-node). See [MQTT contract](#mqtt-contract).
+The tank level is **not** measured locally, and is not received here at all.
+[`tank-node`](https://github.com/archimedes-water-pump-automation/tank-node)
+measures it, decides what it means, and sends this controller the decision —
+`full`, `partial`, `refillable` or `unknown` — over MQTT. See
+[MQTT contract](#mqtt-contract).
 
 ## Behaviour
 
 The pump starts only when inflow from the pipeline is confirmed and the tank
-has room. It stops when the tank is full, when the pipeline goes dry, or when
-any safety limit trips.
+node calls the tank `refillable`. It stops when the tank node calls it `full`,
+when the pipeline goes dry, or when any safety limit trips.
 
 Inflow comes from the upstream valve driven by
 [`scheduled-valve`](../scheduled-valve), which opens on a schedule and closes
@@ -24,7 +27,7 @@ See [MQTT contract](#mqtt-contract).
 | `idle` | Waiting for flow and a low enough tank |
 | `pumping` | Relay closed |
 | `lockout` | Just stopped, waiting out the minimum off time |
-| `fault` | Level unavailable or stale; pump held off |
+| `fault` | Tank state unavailable or stale; pump held off |
 
 Stop reasons published on the pump topic: `tank_full`, `pipeline_dry`,
 `max_runtime`, `sensor_fault`, `sensor_recovered`, `lockout_expired`.
@@ -34,16 +37,22 @@ Stop reasons published on the pump topic: `tank_full`, `pipeline_dry`,
 These are deliberate and should not be relaxed without understanding why they
 are here:
 
-- **Hysteresis.** Stop at `DIST_FULL_CM`, restart only below `DIST_REFILL_CM`.
-  A single threshold makes the relay chatter as the water surface moves.
+- **Hysteresis, applied at the tank node.** It reports `full` at
+  `DIST_FULL_CM` and `refillable` only at the further `DIST_REFILL_CM`, with
+  `partial` in between. This controller starts on `refillable`, never on
+  merely "not full" — a single threshold makes the relay chatter as the water
+  surface moves. Both thresholds live in that node's config, beside the sensor
+  they are applied to; keeping a copy here would be a second set of numbers
+  free to drift from the ones actually deciding.
 - **Dry-run grace period.** The dry cutoff is suppressed for `DRY_GRACE_MS`
   after start, because flow takes time to establish.
-- **Fail-safe on level loss.** An unreadable or stale level is never treated
-  as "tank has room". It stops the pump.
-- **Stale network data is a fault.** A level older than `LEVEL_STALE_MS`
-  counts as no level at all.
-- **Retained messages are rejected.** A retained level is by definition old,
-  but arrival time would score it as fresh.
+- **Fail-safe on tank-state loss.** `unknown`, an unrecognised state, or one
+  from another device is never treated as "tank has room". It stops the pump.
+- **Stale network data is a fault.** A tank state older than `TANK_STALE_MS`
+  counts as no state at all, which is why the node republishes every cycle
+  rather than only on a change.
+- **Retained messages are rejected.** A retained tank state is by definition
+  old, but arrival time would score it as fresh.
 - **Anti short-cycling.** `MIN_OFF_MS` between cycles protects the motor.
 - **Telemetry cannot block control.** Publishes use `esp_mqtt_client_enqueue`
   and are no-ops while offline. An unreachable broker costs log lines, not
@@ -89,25 +98,37 @@ Requires ESP-IDF v5.x.
 ## MQTT contract
 
 Defined in [MQTT_CONTRACT.md](MQTT_CONTRACT.md), which is mirrored in every
-repository of this system. This controller shares the level topic with
-`tank-node` and `archimedes-server`, the pump topic with `archimedes-server`,
-and the command topic with `scheduled-valve`; changing a field means changing
-it on both sides of that topic.
+repository of this system. This controller shares the full_tank topic with
+`tank-node`, the pump topic with `archimedes-server`, and the command topic
+with `scheduled-valve`; changing a field means changing it on both sides of
+that topic.
 
-**Subscribes** to `watertank/tank-01/level` — QoS 0, not retained:
+**Subscribes** to `watertank/tank-01/full_tank` — QoS 0, not retained:
 
 ```json
-{"event":"level","device":"tank-01","timestamp":"2026-09-05T03:10:12Z",
- "valid":true,"distance_cm":62.5,"uptime_s":360}
+{"event":"full_tank","device":"tank-01","timestamp":"2026-09-05T03:10:12Z",
+ "state":"refillable","uptime_s":360}
 ```
 
-`distance_cm` is measured from the sensor face downward, so it *decreases* as
-the tank fills. A message is accepted only if its `event` is `level`, its
-`device` is the configured `TANK_ID`, its `valid` is true, and its
-`distance_cm` is a number inside `DIST_MIN_VALID_CM`–`DIST_MAX_VALID_CM`.
-Everything else — `valid:false` with `distance_cm: null` from an unreadable
-sensor or the node's last will, a reading from another tank, a payload that
-is not a level — counts as a sensor fault, never as room in the tank.
+| `state` | Means | Effect here |
+|---|---|---|
+| `full` | Nowhere left to put water | Stop, reason `tank_full`, release the supply valve |
+| `partial` | Inside the hysteresis band | No transition: running stays running, idle stays idle |
+| `refillable` | Low enough to fill again | May start, once inflow is confirmed |
+| `unknown` | Sensor unreadable, or the node dropped off | Fault: pump held off |
+
+A message is accepted only if its `event` is `full_tank`, its `device` is the
+configured `TANK_ID`, and its `state` is one of the four names above.
+Everything else — an unrecognised state, another tank's state, a payload that
+is not a full_tank event, silence for longer than `TANK_STALE_MS` — is a
+fault, never room in the tank.
+
+**There is no distance on this topic, and this controller subscribes to
+nothing else.** The thresholds that turn a distance into a state live in
+`tank-node`'s config, beside the sensor that produces the distance. Receiving
+the raw reading here as well would mean a second copy of those thresholds,
+free to drift from the ones actually deciding, with no way to tell which copy
+had drifted. The distance goes to `archimedes-server`, which stores it.
 
 **Publishes** to `watertank/pump-01/pump` — QoS 1, retained, one message per
 pump transition:
@@ -115,13 +136,13 @@ pump transition:
 ```json
 {"event":"pump","device":"pump-01","timestamp":"2026-09-05T03:10:12Z",
  "state":"on","reason":"flow_confirmed","flow_lpm":11.40,
- "distance_cm":62.5,"uptime_s":338}
+ "tank_state":"refillable","uptime_s":338}
 ```
 
 `state` is `on` or `off`, and `reason` carries the transition that caused it —
 `archimedes-server` opens a pump run on `on` and closes it on `off`, storing
-`reason` as the stop reason. `distance_cm` is `null` when no valid level was
-available, never `0`.
+`reason` as the stop reason. `tank_state` is the tank node's last word when
+the relay moved, carried for diagnosis.
 
 The last will on the same topic sets `"state":"unknown"` so a dashboard cannot
 show `on` indefinitely for a controller that has lost power. It carries no
@@ -142,16 +163,17 @@ fabricated run in the history.
  "command":"turn_off","reason":"tank_full","uptime_s":607}
 ```
 
-Shared with [`scheduled-valve`](../scheduled-valve), which owns that topic.
-That module opens the supply valve on its own schedule and shuts it again
-unless a `keep_open` reaches it inside its trial window
+Shared with
+[`scheduled-valve`](https://github.com/archimedes-water-pump-automation/scheduled-valve),
+which owns that topic. That module opens the supply valve on its own schedule
+and shuts it again unless a `keep_open` reaches it inside its trial window
 (`KEEP_OPEN_WINDOW_MS`, two minutes by default); once held, it stays open
 until `turn_off` or its own `MAX_HOLD_MS` guard. It reads the `command` field
 and logs the rest.
 
 | Event | Sent when | Ordering |
 |---|---|---|
-| `keep_open` | `idle → pumping`, inflow confirmed and the tank has room | **before** the relay closes |
+| `keep_open` | `idle → pumping`, inflow confirmed and the tank refillable | **before** the relay closes |
 | `turn_off` | pump stops with `tank_full` or `pipeline_dry` | **after** the relay opens |
 
 The two orderings are deliberate and opposite: the valve must be held open
@@ -178,17 +200,19 @@ All tunables are in `main/config.h`.
 
 | Constant | Default | Notes |
 |---|---|---|
-| `DIST_FULL_CM` | 12.0 | Stop threshold. Must clear the transducer blind zone |
-| `DIST_REFILL_CM` | 35.0 | Restart threshold |
 | `FLOW_PULSES_PER_LITRE` | 450.0 | YF-S201 nominal; calibrate per unit |
 | `FLOW_MIN_LPM` | 0.8 | Below this the pipeline counts as dry |
-| `LEVEL_STALE_MS` | 20000 | Four missed tank-node publishes |
-| `TANK_ID` | tank-01 | Tank node followed; checked against each reading's `device` |
+| `TANK_STALE_MS` | 20000 | Four missed tank-node publishes |
+| `TANK_FAULT_LIMIT` | 5 | Consecutive cycles without a usable state before faulting |
+| `TANK_ID` | tank-01 | Tank node followed; checked against each message's `device` |
 | `SNTP_SERVER` | pool.ntp.org | Source of the UTC `timestamp` field |
 | `MIN_OFF_MS` | 30000 | Anti short-cycling |
 | `MAX_RUN_MS` | 30 min | Runaway cutoff |
 
-Widening `LEVEL_STALE_MS` widens the window in which the tank can overflow
+`DIST_FULL_CM` and `DIST_REFILL_CM` are no longer here. They live in
+`tank-node`'s config, beside the sensor whose reading they are applied to.
+
+Widening `TANK_STALE_MS` widens the window in which the tank can overflow
 unobserved.
 
 ## Calibration
@@ -196,14 +220,13 @@ unobserved.
 `FLOW_PULSES_PER_LITRE` varies by 10% or more between units. Run water into a
 measuring jug, log the raw pulse count, divide.
 
-`DIST_FULL_CM` and `DIST_REFILL_CM` depend on where the transducer is
-physically mounted. Measure from the sensor face to the intended stop level
-and add margin.
+The level thresholds are calibrated on the tank node now — see its README.
 
 ## Expected startup behaviour
 
-No level has arrived at boot, so the controller enters `fault` within ~2.5 s,
-moves to `lockout` when the first message lands, then waits out `MIN_OFF_MS`.
+No tank state has arrived at boot, so the controller enters `fault` within
+~2.5 s, moves to `lockout` when the first message lands, then waits out
+`MIN_OFF_MS`.
 Roughly 30–40 s from power-on to ready. This is the fail-safe working.
 
 ## Known gaps

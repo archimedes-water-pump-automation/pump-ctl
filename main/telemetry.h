@@ -2,19 +2,31 @@
 
 #include <stdbool.h>
 
+/* What the tank node reports about the tank. This controller receives
+ * the state, never the distance behind it: both thresholds live in the
+ * tank node's config, with the sensor that produces the reading they
+ * are applied to. See MQTT_CONTRACT.md.
+ *
+ * TANK_PARTIAL is the hysteresis band between them, where a running
+ * pump keeps running and an idle one stays idle. */
+typedef enum {
+    TANK_UNKNOWN,    /* no usable reading; never means room in the tank */
+    TANK_FULL,       /* nowhere to put water: stop pumping             */
+    TANK_PARTIAL,    /* inside the hysteresis band: no transition      */
+    TANK_REFILLABLE  /* low enough to start again                      */
+} tank_state_t;
+
 void telemetry_start(void);
 bool telemetry_online(void);
 
 /* Published once per pump state change, retained, in the envelope
- * MQTT_CONTRACT.md defines for the pump topic. Pass
- * distance_valid=false when no usable level was available: the reading
- * then goes out as null rather than as a distance of zero, which the
- * server would read as a full tank. */
+ * MQTT_CONTRACT.md defines for the pump topic. tank_state is the tank
+ * node's last word on the tank, carried for diagnosis: it says what
+ * this controller was acting on when it moved the relay. */
 void telemetry_publish_pump(bool on,
                             const char *reason,
                             float flow_lpm,
-                            float distance_cm,
-                            bool distance_valid);
+                            tank_state_t tank_state);
 
 /* Asks the upstream activator to hold its supply valve open.
  *
@@ -34,9 +46,13 @@ void telemetry_publish_keep_open(const char *reason);
  * two stops it was. */
 void telemetry_publish_turn_off(const char *reason);
 
-/* Latest tank level received over MQTT.
+/* Latest tank state received over MQTT.
  *
- * Returns false when no reading has arrived, the last one was flagged
- * invalid, or it is older than LEVEL_STALE_MS. The caller must treat a
- * false return as a sensor fault, never as "tank still has room". */
-bool telemetry_level_get(float *out_cm);
+ * Writes TANK_UNKNOWN and returns false when nothing has arrived, the
+ * tank node reported the state unknown, or the last message is older
+ * than TANK_STALE_MS. The caller must treat a false return as a fault,
+ * never as "tank still has room". */
+bool telemetry_tank_state_get(tank_state_t *out_state);
+
+/* The wire name of a state, for logging and for the pump event. */
+const char *tank_state_name(tank_state_t state);

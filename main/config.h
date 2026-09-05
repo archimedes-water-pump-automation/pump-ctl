@@ -9,17 +9,18 @@
 #define PIN_FLOW   GPIO_NUM_27   /* YF-S201 pulse, level shifted */
 #define PIN_RELAY  GPIO_NUM_33   /* relay module IN              */
 
-/* The ultrasonic sensor no longer connects here. It lives on the
- * tank node and arrives over MQTT. */
+/* The ultrasonic sensor no longer connects here, and neither does its
+ * reading: the tank node measures the distance and decides what it
+ * means. This controller receives that decision, not the centimetres
+ * behind it. */
 
 #define RELAY_ACTIVE_LOW 1
 
-/* ======================= tank geometry ======================= */
-
-#define DIST_FULL_CM      12.0f   /* <= this: tank is full, stop pumping */
-#define DIST_REFILL_CM    35.0f   /* >= this: low enough to start again  */
-#define DIST_MIN_VALID_CM  3.0f   /* sanity check on received values     */
-#define DIST_MAX_VALID_CM 400.0f
+/* No tank geometry here any more. DIST_FULL_CM, DIST_REFILL_CM and the
+ * validity range moved to the tank node's config.h, next to the sensor
+ * that produces the distance they are applied to. A threshold kept here
+ * as well would be a second copy, free to drift from the one actually
+ * deciding, with no way to tell which had drifted. */
 
 /* ======================= flow ======================= */
 
@@ -34,12 +35,12 @@
 #define FLOW_CONFIRM_MS       3000
 #define MIN_OFF_MS           30000
 #define MAX_RUN_MS      (30 * 60 * 1000)
-#define LEVEL_FAULT_LIMIT        5
+#define TANK_FAULT_LIMIT         5
 
 /* The tank node publishes every 5 s. Four missed messages is a link
  * that is no longer trustworthy, so the pump stops. Widening this
  * widens the window in which the tank can overflow unobserved. */
-#define LEVEL_STALE_MS       20000
+#define TANK_STALE_MS        20000
 
 /* ======================= clock ======================= */
 
@@ -57,13 +58,17 @@
 #endif
 
 /* The tank node this controller follows. Its id is checked against the
- * device field of every level message: the topic says where a reading
- * arrived, the envelope says who measured it, and a reading from
- * another tank is not this tank's level. */
+ * device field of every message on the topic below: the topic says
+ * where a message arrived, the envelope says who sent it, and another
+ * tank's state is not this tank's state. */
 #define TANK_ID "tank-01"
 
-#define TOPIC_PUMP  "watertank/" DEVICE_ID "/pump"
-#define TOPIC_LEVEL "watertank/" TANK_ID "/level"  /* subscribed, not published */
+#define TOPIC_PUMP "watertank/" DEVICE_ID "/pump"
+
+/* The tank node's derived state: full, partial, refillable, unknown.
+ * Not its level. The distance stays between that node and the server;
+ * this controller is told what the tank is, not what it measures. */
+#define TOPIC_FULL_TANK "watertank/" TANK_ID "/full_tank"  /* subscribed */
 
 /* ======================= upstream activator ======================= */
 
