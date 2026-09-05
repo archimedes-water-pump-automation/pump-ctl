@@ -64,7 +64,7 @@ typedef enum {
     ST_IDLE,      /* waiting for flow and a low enough tank */
     ST_PUMPING,
     ST_LOCKOUT,   /* just stopped, cooling down             */
-    ST_FAULT      /* level sensor unusable, pump held off   */
+    ST_FAULT      /* tank state unusable, pump held off     */
 } pump_state_t;
 
 static const char *state_name(pump_state_t s)
@@ -86,10 +86,9 @@ static void control_task(void *arg)
     const char  *reason   = "boot";
 
     int64_t state_since_ms = esp_timer_get_time() / 1000;
-    int64_t last_level_pub = 0;
     int64_t flow_ok_since  = 0;   /* 0 == not currently flowing */
     int64_t dry_since      = 0;   /* 0 == not currently dry     */
-    int     level_faults   = 0;
+    int     tank_faults    = 0;
 
     for (;;) {
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -97,13 +96,16 @@ static void control_task(void *arg)
         float lpm     = flow_read_lpm();
         bool  flowing = lpm >= FLOW_MIN_LPM;
 
-        float dist_cm  = 0.0f;
-        bool  level_ok = telemetry_level_get(&dist_cm);
+        /* The tank node's own verdict on the tank: full, not full, or
+         * nothing usable. The threshold behind it lives over there,
+         * with the sensor. It can only ever stop this pump. */
+        tank_state_t tank    = TANK_UNKNOWN;
+        bool         tank_ok = telemetry_tank_state_get(&tank);
 
-        if (level_ok) {
-            level_faults = 0;
-        } else if (level_faults < LEVEL_FAULT_LIMIT) {
-            level_faults++;
+        if (tank_ok) {
+            tank_faults = 0;
+        } else if (tank_faults < TANK_FAULT_LIMIT) {
+            tank_faults++;
         }
 
         if (flowing) {
@@ -112,6 +114,16 @@ static void control_task(void *arg)
         } else {
             if (dry_since == 0) dry_since = now_ms;
             flow_ok_since = 0;
+        }
+
+        /* First time the broker is reachable since boot, say what the
+         * relay is actually doing. The pump topic is retained, so until
+         * this goes out it still holds whatever was published before the
+         * restart, and a run the server opened before a crash has
+         * nothing to close it. */
+        if (telemetry_take_first_connect()) {
+            ESP_LOGI(TAG, "announcing boot state: pump %s", pump_on ? "on" : "off");
+            telemetry_publish_pump(pump_on, "boot", lpm, tank);
         }
 
         pump_state_t next = state;
@@ -125,25 +137,42 @@ static void control_task(void *arg)
         switch (state) {
 
         case ST_IDLE:
-            /* Start only on confirmed inflow and a tank with room in it.
-             * An unreadable level sensor is never a reason to start. */
-            if (level_faults >= LEVEL_FAULT_LIMIT) {
+            /* Confirmed inflow is the only thing that starts this pump.
+             * The tank level does not start it and never did anything
+             * but stop it: water arriving in the pipeline is the whole
+             * reason to run, and a tank that has drained is not, on its
+             * own, water to pump.
+             *
+             * The tank still gets a veto. A tank the node last called
+             * full has nowhere to put what the pipeline is delivering,
+             * so starting into it would close the relay and open it
+             * again on the next cycle with tank_full. Blocking is not
+             * starting: flow remains the only trigger.
+             *
+             * A state that is merely stale does not block a start —
+             * flow is the trigger, and a link that stays quiet trips
+             * the fault below within TANK_FAULT_LIMIT cycles anyway. */
+            if (tank_faults >= TANK_FAULT_LIMIT) {
                 next   = ST_FAULT;
                 reason = "sensor_fault";
-            } else if (level_ok &&
-                       flow_ok_since != 0 &&
+            } else if (flow_ok_since != 0 &&
                        (now_ms - flow_ok_since) >= FLOW_CONFIRM_MS &&
-                       dist_cm >= DIST_REFILL_CM) {
+                       tank != TANK_FULL) {
                 next   = ST_PUMPING;
                 reason = "flow_confirmed";
             }
             break;
 
         case ST_PUMPING:
-            if (level_faults >= LEVEL_FAULT_LIMIT) {
+            /* Two things stop a running pump: the tank filling up, and
+             * the pipeline running dry. The rest of this branch is
+             * guards, not control — a tank node that has gone quiet
+             * cannot tell us the tank filled, and MAX_RUN_MS is a
+             * runaway cutoff for a pump that neither ever reports. */
+            if (tank_faults >= TANK_FAULT_LIMIT) {
                 next   = ST_FAULT;
                 reason = "sensor_fault";
-            } else if (level_ok && dist_cm <= DIST_FULL_CM) {
+            } else if (tank_ok && tank == TANK_FULL) {
                 next            = ST_LOCKOUT;
                 reason          = "tank_full";
                 release_supply  = true;   /* nowhere left to put water */
@@ -167,8 +196,8 @@ static void control_task(void *arg)
             break;
 
         case ST_FAULT:
-            /* Recovers on its own once the sensor reads again. */
-            if (level_ok) {
+            /* Recovers on its own once the tank node reports again. */
+            if (tank_ok) {
                 next   = ST_LOCKOUT;
                 reason = "sensor_recovered";
             }
@@ -178,7 +207,8 @@ static void control_task(void *arg)
         if (next != state) {
             state          = next;
             state_since_ms = now_ms;
-            ESP_LOGI(TAG, "-> %s (%s)", state_name(state), reason);
+            ESP_LOGI(TAG, "-> %s (%s), tank %s",
+                     state_name(state), reason, tank_state_name(tank));
 
             bool want_pump = (state == ST_PUMPING);
             if (want_pump != pump_on) {
@@ -195,15 +225,14 @@ static void control_task(void *arg)
                  * the valve times out, the pipeline goes dry and the
                  * existing dry cutoff stops the pump. */
                 if (want_pump) {
-                    telemetry_publish_keep_open();
+                    telemetry_publish_keep_open(reason);
                 }
 
                 /* The relay moves before telemetry. Reporting follows
                  * the physical action, never gates it. */
                 pump_on = want_pump;
                 relay_write(pump_on);
-                telemetry_publish_pump(pump_on, reason, lpm,
-                                       dist_cm, level_ok);
+                telemetry_publish_pump(pump_on, reason, lpm, tank);
 
                 /* Release the valve only once the pump is already off.
                  * It feeds the pipeline this pump draws on, so shutting
@@ -211,15 +240,9 @@ static void control_task(void *arg)
                  * this one goes missing either: the activator closes on
                  * its own runaway guard. */
                 if (!want_pump && release_supply) {
-                    telemetry_publish_turn_off();
+                    telemetry_publish_turn_off(reason);
                 }
             }
-        }
-
-        if (last_level_pub == 0 ||
-            (now_ms - last_level_pub) >= LEVEL_PUBLISH_MS) {
-            last_level_pub = now_ms;
-            telemetry_publish_level(dist_cm, level_ok, pump_on, lpm);
         }
 
         vTaskDelay(pdMS_TO_TICKS(CONTROL_PERIOD_MS));

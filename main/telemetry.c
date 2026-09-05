@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,32 +14,51 @@
 
 #include "config.h"
 #include "telemetry.h"
+#include "wallclock.h"
 
 static const char *TAG = "telemetry";
 
 static esp_mqtt_client_handle_t s_client;
 static volatile bool            s_connected;
 
+/* Set by the MQTT task on the first connection since boot, taken by the
+ * control task. */
+static portMUX_TYPE  s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool          s_first_connect_pending;
+static bool          s_first_connect_seen;
+
 /* Written by the MQTT task, read by the control task. */
-static portMUX_TYPE s_level_mux = portMUX_INITIALIZER_UNLOCKED;
-static float        s_level_cm;
-static bool         s_level_valid;
-static int64_t      s_level_rx_ms;
+static portMUX_TYPE  s_tank_mux = portMUX_INITIALIZER_UNLOCKED;
+static tank_state_t  s_tank_state;
+static int64_t       s_tank_rx_ms;
 
 /* Retained on the pump topic if the broker loses us without a clean
  * disconnect. A dashboard must not keep showing "on" for a controller
- * that has been unplugged for an hour. */
+ * that has been unplugged for an hour, and the server needs the device
+ * field to know whose pump this is.
+ *
+ * It carries neither timestamp nor uptime: the broker publishes it on
+ * this controller's behalf, long after the controller wrote it, so both
+ * would be lies. MQTT_CONTRACT.md makes them optional for this case. */
 static const char *LWT_PAYLOAD =
-    "{\"event\":\"pump\",\"state\":\"unknown\",\"reason\":\"controller_offline\"}";
-
-/* The activator accepts the bare command words too; the JSON form is
- * used here so the payloads stay self-describing on the wire. */
-static const char *KEEP_OPEN_PAYLOAD = "{\"command\":\"keep_open\"}";
-static const char *TURN_OFF_PAYLOAD  = "{\"command\":\"turn_off\"}";
+    "{\"event\":\"pump\",\"device\":\"" DEVICE_ID "\","
+    "\"state\":\"unknown\",\"reason\":\"controller_offline\"}";
 
 bool telemetry_online(void)
 {
     return s_connected;
+}
+
+bool telemetry_take_first_connect(void)
+{
+    bool taken;
+
+    portENTER_CRITICAL(&s_conn_mux);
+    taken = s_first_connect_pending;
+    s_first_connect_pending = false;
+    portEXIT_CRITICAL(&s_conn_mux);
+
+    return taken;
 }
 
 static uint32_t uptime_s(void)
@@ -63,82 +83,170 @@ static void publish(const char *topic, const char *payload, int qos, int retain)
     }
 }
 
+/* Appends to buf at *off, tracking the length the message would have
+ * needed so the caller can tell a truncated payload from a whole one. */
+static void json_append(char *buf, size_t size, size_t *off,
+                        const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(*off < size ? buf + *off : NULL,
+                      *off < size ? size - *off : 0,
+                      fmt, ap);
+    va_end(ap);
+
+    if (n > 0) {
+        *off += (size_t)n;
+    }
+}
+
+/* Writes the envelope every message on every topic shares: the event
+ * name, this device, and the UTC timestamp when the clock has one. See
+ * MQTT_CONTRACT.md. */
+static void json_open_envelope(char *buf, size_t size, size_t *off,
+                               const char *event)
+{
+    char ts[WALLCLOCK_ISO8601_LEN];
+
+    json_append(buf, size, off, "{\"event\":\"%s\",\"device\":\"%s\"",
+                event, DEVICE_ID);
+
+    if (wallclock_iso8601(ts, sizeof(ts))) {
+        json_append(buf, size, off, ",\"timestamp\":\"%s\"", ts);
+    }
+}
+
 void telemetry_publish_pump(bool on,
                             const char *reason,
                             float flow_lpm,
-                            float distance_cm,
-                            bool distance_valid)
+                            tank_state_t tank_state)
 {
-    char payload[224];
+    char   payload[256];
+    size_t off = 0;
 
-    if (distance_valid) {
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"pump\",\"device\":\"%s\",\"state\":\"%s\","
-                 "\"reason\":\"%s\",\"flow_lpm\":%.2f,\"distance_cm\":%.1f,"
-                 "\"uptime_s\":%lu}",
-                 DEVICE_ID, on ? "on" : "off", reason,
-                 flow_lpm, distance_cm, (unsigned long)uptime_s());
-    } else {
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"pump\",\"device\":\"%s\",\"state\":\"%s\","
-                 "\"reason\":\"%s\",\"flow_lpm\":%.2f,\"distance_cm\":null,"
-                 "\"uptime_s\":%lu}",
-                 DEVICE_ID, on ? "on" : "off", reason,
-                 flow_lpm, (unsigned long)uptime_s());
+    json_open_envelope(payload, sizeof(payload), &off, "pump");
+    json_append(payload, sizeof(payload), &off,
+                ",\"state\":\"%s\",\"reason\":\"%s\",\"flow_lpm\":%.2f"
+                ",\"tank_state\":\"%s\"",
+                on ? "on" : "off", reason, flow_lpm,
+                tank_state_name(tank_state));
+
+    json_append(payload, sizeof(payload), &off, ",\"uptime_s\":%lu}",
+                (unsigned long)uptime_s());
+
+    if (off >= sizeof(payload)) {
+        ESP_LOGE(TAG, "pump payload truncated at %u bytes, not published",
+                 (unsigned)sizeof(payload));
+        return;
     }
 
     ESP_LOGI(TAG, "pump event: %s (%s)", on ? "on" : "off", reason);
     publish(TOPIC_PUMP, payload, 1, 1);
 }
 
-/* Neither command is retained. The activator rejects retained commands
- * anyway: a replayed keep_open would hold the valve open with no trial
- * behind it, and a replayed turn_off would shut a trial that has only
- * just started. */
-void telemetry_publish_keep_open(void)
+/* Both commands share the envelope with everything else this controller
+ * publishes; the activator reads the command field and logs the rest.
+ * Neither is retained. The activator rejects retained commands anyway:
+ * a replayed keep_open would hold the valve open with no trial behind
+ * it, and a replayed turn_off would shut a trial that has only just
+ * started. */
+static void publish_command(const char *command, const char *reason)
 {
-    ESP_LOGI(TAG, "keep_open -> %s", TOPIC_ACTIVATOR_CMD);
-    publish(TOPIC_ACTIVATOR_CMD, KEEP_OPEN_PAYLOAD, 1, 0);
+    char   payload[224];
+    size_t off = 0;
+
+    json_open_envelope(payload, sizeof(payload), &off, "command");
+    json_append(payload, sizeof(payload), &off,
+                ",\"command\":\"%s\",\"reason\":\"%s\"", command, reason);
+    json_append(payload, sizeof(payload), &off, ",\"uptime_s\":%lu}",
+                (unsigned long)uptime_s());
+
+    if (off >= sizeof(payload)) {
+        ESP_LOGE(TAG, "command payload truncated at %u bytes, not published",
+                 (unsigned)sizeof(payload));
+        return;
+    }
+
+    ESP_LOGI(TAG, "%s (%s) -> %s", command, reason, TOPIC_ACTIVATOR_CMD);
+    publish(TOPIC_ACTIVATOR_CMD, payload, 1, 0);
 }
 
-void telemetry_publish_turn_off(void)
+void telemetry_publish_keep_open(const char *reason)
 {
-    ESP_LOGI(TAG, "turn_off -> %s", TOPIC_ACTIVATOR_CMD);
-    publish(TOPIC_ACTIVATOR_CMD, TURN_OFF_PAYLOAD, 1, 0);
+    publish_command("keep_open", reason);
 }
 
-bool telemetry_level_get(float *out_cm)
+void telemetry_publish_turn_off(const char *reason)
 {
-    float   cm;
-    bool    valid;
-    int64_t rx_ms;
+    publish_command("turn_off", reason);
+}
 
-    portENTER_CRITICAL(&s_level_mux);
-    cm    = s_level_cm;
-    valid = s_level_valid;
-    rx_ms = s_level_rx_ms;
-    portEXIT_CRITICAL(&s_level_mux);
+const char *tank_state_name(tank_state_t state)
+{
+    switch (state) {
+        case TANK_FULL:     return "full";
+        case TANK_NOT_FULL: return "not_full";
+        default:            return "unknown";
+    }
+}
 
-    if (!valid || rx_ms == 0) {
+bool telemetry_tank_state_get(tank_state_t *out_state)
+{
+    tank_state_t state;
+    int64_t      rx_ms;
+
+    portENTER_CRITICAL(&s_tank_mux);
+    state = s_tank_state;
+    rx_ms = s_tank_rx_ms;
+    portEXIT_CRITICAL(&s_tank_mux);
+
+    *out_state = TANK_UNKNOWN;
+
+    if (rx_ms == 0 || state == TANK_UNKNOWN) {
         return false;
     }
 
     int64_t age = (esp_timer_get_time() / 1000) - rx_ms;
-    if (age > LEVEL_STALE_MS) {
-        ESP_LOGW(TAG, "level stale by %lld ms", age);
+    if (age > TANK_STALE_MS) {
+        ESP_LOGW(TAG, "tank state stale by %lld ms", age);
         return false;
     }
 
-    *out_cm = cm;
+    *out_state = state;
     return true;
 }
 
-static void handle_level_message(const char *data, int len)
+/* Maps a wire state name onto the enum. An unrecognised name is
+ * TANK_UNKNOWN: a state this controller cannot interpret is a state it
+ * must not act on. */
+static tank_state_t tank_state_from_name(const char *name)
+{
+    if (strcmp(name, "full") == 0) {
+        return TANK_FULL;
+    }
+    if (strcmp(name, "not_full") == 0) {
+        return TANK_NOT_FULL;
+    }
+    return TANK_UNKNOWN;
+}
+
+/* Parses one full_tank message. The shape it expects is fixed by
+ * MQTT_CONTRACT.md and is what tank-node publishes:
+ *
+ *   {"event":"full_tank","device":"tank-01","timestamp":"...",
+ *    "state":"full","uptime_s":360}
+ *
+ * There is no distance in it, by design: the tank node owns the
+ * threshold, so there is nothing here to re-derive with a copy of it
+ * that has drifted. Anything that fails a check is recorded as
+ * TANK_UNKNOWN, which the control loop treats as a fault. It is never
+ * recorded as room in the tank. */
+static void handle_tank_message(const char *data, int len)
 {
     char buf[256];
 
     if (len <= 0 || len >= (int)sizeof(buf)) {
-        ESP_LOGW(TAG, "level payload size %d rejected", len);
+        ESP_LOGW(TAG, "tank payload size %d rejected", len);
         return;
     }
     memcpy(buf, data, len);
@@ -146,33 +254,45 @@ static void handle_level_message(const char *data, int len)
 
     cJSON *root = cJSON_Parse(buf);
     if (root == NULL) {
-        ESP_LOGW(TAG, "level payload not valid json");
+        ESP_LOGW(TAG, "tank payload not valid json");
         return;
     }
 
-    const cJSON *valid = cJSON_GetObjectItemCaseSensitive(root, "valid");
-    const cJSON *dist  = cJSON_GetObjectItemCaseSensitive(root, "distance_cm");
+    const cJSON *event  = cJSON_GetObjectItemCaseSensitive(root, "event");
+    const cJSON *device = cJSON_GetObjectItemCaseSensitive(root, "device");
+    const cJSON *state  = cJSON_GetObjectItemCaseSensitive(root, "state");
 
-    bool  ok = cJSON_IsTrue(valid) && cJSON_IsNumber(dist);
-    float cm = ok ? (float)dist->valuedouble : 0.0f;
-
-    /* Trust the network no further than the sensor. A value outside the
-     * physical range means a wrong device is publishing here, or the
-     * tank node is misconfigured. Either way it is not a level. */
-    if (ok && (cm < DIST_MIN_VALID_CM || cm > DIST_MAX_VALID_CM)) {
-        ESP_LOGW(TAG, "level %.1f cm out of range, rejected", cm);
-        ok = false;
+    /* The envelope identifies the message before its fields are read.
+     * A payload that is not a full_tank event, or is somebody else's,
+     * tells us nothing about this tank. */
+    if (!cJSON_IsString(event) || strcmp(event->valuestring, "full_tank") != 0) {
+        ESP_LOGW(TAG, "payload on tank topic is not a full_tank event");
+        cJSON_Delete(root);
+        return;
+    }
+    if (!cJSON_IsString(device) || strcmp(device->valuestring, TANK_ID) != 0) {
+        ESP_LOGW(TAG, "tank state from unexpected device, rejected");
+        cJSON_Delete(root);
+        return;
     }
 
-    portENTER_CRITICAL(&s_level_mux);
-    s_level_cm    = cm;
-    s_level_valid = ok;
-    s_level_rx_ms = esp_timer_get_time() / 1000;
-    portEXIT_CRITICAL(&s_level_mux);
-
-    if (!ok) {
-        ESP_LOGW(TAG, "tank node reports level invalid");
+    tank_state_t parsed = TANK_UNKNOWN;
+    if (cJSON_IsString(state) && state->valuestring != NULL) {
+        parsed = tank_state_from_name(state->valuestring);
     }
+
+    portENTER_CRITICAL(&s_tank_mux);
+    s_tank_state = parsed;
+    s_tank_rx_ms = esp_timer_get_time() / 1000;
+    portEXIT_CRITICAL(&s_tank_mux);
+
+    if (parsed == TANK_UNKNOWN) {
+        const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+        ESP_LOGW(TAG, "tank node reports state unknown (%s)",
+                 cJSON_IsString(reason) ? reason->valuestring : "no reason");
+    }
+
+    cJSON_Delete(root);
 }
 
 /* ======================= event handlers ======================= */
@@ -186,8 +306,15 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             s_connected = true;
-            esp_mqtt_client_subscribe(s_client, TOPIC_LEVEL, 0);
-            ESP_LOGI(TAG, "broker connected, subscribed to %s", TOPIC_LEVEL);
+            esp_mqtt_client_subscribe(s_client, TOPIC_FULL_TANK, 0);
+            ESP_LOGI(TAG, "broker connected, subscribed to %s", TOPIC_FULL_TANK);
+
+            portENTER_CRITICAL(&s_conn_mux);
+            if (!s_first_connect_seen) {
+                s_first_connect_seen    = true;
+                s_first_connect_pending = true;
+            }
+            portEXIT_CRITICAL(&s_conn_mux);
             break;
         case MQTT_EVENT_DISCONNECTED:
             s_connected = false;
@@ -195,12 +322,12 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
             break;
         case MQTT_EVENT_DATA:
             /* Ignore fragmented payloads and retained messages. A
-             * retained level is by definition old, and arrival time
-             * would make it look fresh. */
+             * retained tank state is by definition old, and arrival
+             * time would make it look fresh. */
             if (event->data_len == event->total_data_len &&
                 event->current_data_offset == 0 &&
                 !event->retain) {
-                handle_level_message(event->data, event->data_len);
+                handle_tank_message(event->data, event->data_len);
             }
             break;
         case MQTT_EVENT_ERROR:
