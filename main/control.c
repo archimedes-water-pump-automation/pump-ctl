@@ -116,6 +116,12 @@ static void control_task(void *arg)
 
         pump_state_t next = state;
 
+        /* Set alongside a stop reason that means the pipeline is no
+         * longer wanted open. The other stops are this controller's own
+         * limits and it expects to resume shortly, so they leave the
+         * supply where it is. */
+        bool release_supply = false;
+
         switch (state) {
 
         case ST_IDLE:
@@ -138,13 +144,15 @@ static void control_task(void *arg)
                 next   = ST_FAULT;
                 reason = "sensor_fault";
             } else if (level_ok && dist_cm <= DIST_FULL_CM) {
-                next   = ST_LOCKOUT;
-                reason = "tank_full";
+                next            = ST_LOCKOUT;
+                reason          = "tank_full";
+                release_supply  = true;   /* nowhere left to put water */
             } else if ((now_ms - state_since_ms) >= DRY_GRACE_MS &&
                        dry_since != 0 &&
                        (now_ms - dry_since) >= DRY_CONFIRM_MS) {
-                next   = ST_LOCKOUT;
-                reason = "pipeline_dry";
+                next            = ST_LOCKOUT;
+                reason          = "pipeline_dry";
+                release_supply  = true;   /* nothing coming down the pipe */
             } else if ((now_ms - state_since_ms) >= MAX_RUN_MS) {
                 next   = ST_LOCKOUT;
                 reason = "max_runtime";
@@ -196,6 +204,15 @@ static void control_task(void *arg)
                 relay_write(pump_on);
                 telemetry_publish_pump(pump_on, reason, lpm,
                                        dist_cm, level_ok);
+
+                /* Release the valve only once the pump is already off.
+                 * It feeds the pipeline this pump draws on, so shutting
+                 * it first would run the pump dry. Nothing is lost if
+                 * this one goes missing either: the activator closes on
+                 * its own runaway guard. */
+                if (!want_pump && release_supply) {
+                    telemetry_publish_turn_off();
+                }
             }
         }
 

@@ -60,10 +60,14 @@
  * inflow is confirmed, so the valve keeps feeding the pipeline the
  * pump is about to draw on.
  *
- * Its command topic is the only thing shared with that module. The
- * event is published QoS 1 and never retained: it authorises one
- * specific trial, and a retained copy would replay on every reconnect
- * and hold a mains valve open with no trial behind it. */
+ * The reverse event, turn_off, releases that hold once the tank is
+ * full or the pipeline has gone dry, rather than leaving the valve to
+ * sit open until the activator's own four-hour runaway guard.
+ *
+ * Its command topic is the only thing shared with that module. Both
+ * events are published QoS 1 and never retained: each authorises one
+ * specific moment, and a retained copy would replay on every reconnect
+ * and act with nothing behind it. */
 #define ACTIVATOR_ID "activator-01"
 
 #define TOPIC_ACTIVATOR_CMD "watertank/" ACTIVATOR_ID "/cmd"   /* published */
