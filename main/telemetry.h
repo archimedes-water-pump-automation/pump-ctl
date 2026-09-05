@@ -12,6 +12,13 @@ void telemetry_publish_pump(bool on,
                             float distance_cm,
                             bool distance_valid);
 
+/* Asks the upstream activator to hold its supply valve open.
+ *
+ * Sent when the flow sensor confirms inflow, before the pump starts.
+ * Like every publish here it enqueues and is a no-op while offline,
+ * so it can never gate or delay the relay. */
+void telemetry_publish_keep_open(void);
+
 /* Latest tank level received over MQTT.
  *
  * Returns false when no reading has arrived, the last one was flagged

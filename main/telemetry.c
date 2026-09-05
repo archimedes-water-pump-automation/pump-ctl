@@ -31,6 +31,10 @@ static int64_t      s_level_rx_ms;
 static const char *LWT_PAYLOAD =
     "{\"event\":\"pump\",\"state\":\"unknown\",\"reason\":\"controller_offline\"}";
 
+/* The activator accepts a bare "keep_open" too; the JSON form is used
+ * here so the payload stays self-describing on the wire. */
+static const char *KEEP_OPEN_PAYLOAD = "{\"command\":\"keep_open\"}";
+
 bool telemetry_online(void)
 {
     return s_connected;
@@ -84,6 +88,16 @@ void telemetry_publish_pump(bool on,
 
     ESP_LOGI(TAG, "pump event: %s (%s)", on ? "on" : "off", reason);
     publish(TOPIC_PUMP, payload, 1, 1);
+}
+
+void telemetry_publish_keep_open(void)
+{
+    ESP_LOGI(TAG, "keep_open -> %s", TOPIC_ACTIVATOR_CMD);
+
+    /* Not retained. The activator rejects retained commands anyway,
+     * because a replayed keep_open would hold the valve open with no
+     * trial behind it. */
+    publish(TOPIC_ACTIVATOR_CMD, KEEP_OPEN_PAYLOAD, 1, 0);
 }
 
 bool telemetry_level_get(float *out_cm)

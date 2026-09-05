@@ -172,10 +172,26 @@ static void control_task(void *arg)
             state_since_ms = now_ms;
             ESP_LOGI(TAG, "-> %s (%s)", state_name(state), reason);
 
-            /* The relay moves first. Telemetry is reported after the
-             * physical action, never as a precondition for it. */
             bool want_pump = (state == ST_PUMPING);
             if (want_pump != pump_on) {
+                /* Confirmed inflow means the upstream valve is inside
+                 * its trial window and will shut again on its own
+                 * unless it hears keep_open. Send it before the relay
+                 * closes, so the valve is held open before the pump
+                 * starts drawing on the pipeline.
+                 *
+                 * This does not weaken "the relay moves first": the
+                 * publish enqueues and is a no-op while offline, so it
+                 * can neither block the control task nor become a
+                 * precondition for the physical action. If it is lost,
+                 * the valve times out, the pipeline goes dry and the
+                 * existing dry cutoff stops the pump. */
+                if (want_pump) {
+                    telemetry_publish_keep_open();
+                }
+
+                /* The relay moves before telemetry. Reporting follows
+                 * the physical action, never gates it. */
                 pump_on = want_pump;
                 relay_write(pump_on);
                 telemetry_publish_pump(pump_on, reason, lpm,
