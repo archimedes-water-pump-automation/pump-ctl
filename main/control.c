@@ -86,7 +86,6 @@ static void control_task(void *arg)
     const char  *reason   = "boot";
 
     int64_t state_since_ms = esp_timer_get_time() / 1000;
-    int64_t last_level_pub = 0;
     int64_t flow_ok_since  = 0;   /* 0 == not currently flowing */
     int64_t dry_since      = 0;   /* 0 == not currently dry     */
     int     level_faults   = 0;
@@ -195,7 +194,7 @@ static void control_task(void *arg)
                  * the valve times out, the pipeline goes dry and the
                  * existing dry cutoff stops the pump. */
                 if (want_pump) {
-                    telemetry_publish_keep_open();
+                    telemetry_publish_keep_open(reason);
                 }
 
                 /* The relay moves before telemetry. Reporting follows
@@ -211,15 +210,9 @@ static void control_task(void *arg)
                  * this one goes missing either: the activator closes on
                  * its own runaway guard. */
                 if (!want_pump && release_supply) {
-                    telemetry_publish_turn_off();
+                    telemetry_publish_turn_off(reason);
                 }
             }
-        }
-
-        if (last_level_pub == 0 ||
-            (now_ms - last_level_pub) >= LEVEL_PUBLISH_MS) {
-            last_level_pub = now_ms;
-            telemetry_publish_level(dist_cm, level_ok, pump_on, lpm);
         }
 
         vTaskDelay(pdMS_TO_TICKS(CONTROL_PERIOD_MS));

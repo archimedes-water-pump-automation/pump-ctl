@@ -41,6 +41,13 @@
  * widens the window in which the tank can overflow unobserved. */
 #define LEVEL_STALE_MS       20000
 
+/* ======================= clock ======================= */
+
+/* Pump events carry a UTC timestamp once SNTP has landed; see
+ * MQTT_CONTRACT.md. Until then the field is absent and the server falls
+ * back to its own receipt time. The clock never gates the relay. */
+#define SNTP_SERVER "pool.ntp.org"
+
 /* ======================= network ======================= */
 
 #if __has_include("secrets.h")
@@ -49,8 +56,14 @@
 #error "Copy main/secrets.h.example to main/secrets.h and fill in credentials"
 #endif
 
+/* The tank node this controller follows. Its id is checked against the
+ * device field of every level message: the topic says where a reading
+ * arrived, the envelope says who measured it, and a reading from
+ * another tank is not this tank's level. */
+#define TANK_ID "tank-01"
+
 #define TOPIC_PUMP  "watertank/" DEVICE_ID "/pump"
-#define TOPIC_LEVEL "watertank/tank-01/level"   /* subscribed, not published */
+#define TOPIC_LEVEL "watertank/" TANK_ID "/level"  /* subscribed, not published */
 
 /* ======================= upstream activator ======================= */
 

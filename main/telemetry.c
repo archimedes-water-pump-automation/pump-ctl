@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,6 +14,7 @@
 
 #include "config.h"
 #include "telemetry.h"
+#include "wallclock.h"
 
 static const char *TAG = "telemetry";
 
@@ -27,14 +29,15 @@ static int64_t      s_level_rx_ms;
 
 /* Retained on the pump topic if the broker loses us without a clean
  * disconnect. A dashboard must not keep showing "on" for a controller
- * that has been unplugged for an hour. */
+ * that has been unplugged for an hour, and the server needs the device
+ * field to know whose pump this is.
+ *
+ * It carries neither timestamp nor uptime: the broker publishes it on
+ * this controller's behalf, long after the controller wrote it, so both
+ * would be lies. MQTT_CONTRACT.md makes them optional for this case. */
 static const char *LWT_PAYLOAD =
-    "{\"event\":\"pump\",\"state\":\"unknown\",\"reason\":\"controller_offline\"}";
-
-/* The activator accepts the bare command words too; the JSON form is
- * used here so the payloads stay self-describing on the wire. */
-static const char *KEEP_OPEN_PAYLOAD = "{\"command\":\"keep_open\"}";
-static const char *TURN_OFF_PAYLOAD  = "{\"command\":\"turn_off\"}";
+    "{\"event\":\"pump\",\"device\":\"" DEVICE_ID "\","
+    "\"state\":\"unknown\",\"reason\":\"controller_offline\"}";
 
 bool telemetry_online(void)
 {
@@ -63,48 +66,110 @@ static void publish(const char *topic, const char *payload, int qos, int retain)
     }
 }
 
+/* Appends to buf at *off, tracking the length the message would have
+ * needed so the caller can tell a truncated payload from a whole one. */
+static void json_append(char *buf, size_t size, size_t *off,
+                        const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(*off < size ? buf + *off : NULL,
+                      *off < size ? size - *off : 0,
+                      fmt, ap);
+    va_end(ap);
+
+    if (n > 0) {
+        *off += (size_t)n;
+    }
+}
+
+/* Writes the envelope every message on every topic shares: the event
+ * name, this device, and the UTC timestamp when the clock has one. See
+ * MQTT_CONTRACT.md. */
+static void json_open_envelope(char *buf, size_t size, size_t *off,
+                               const char *event)
+{
+    char ts[WALLCLOCK_ISO8601_LEN];
+
+    json_append(buf, size, off, "{\"event\":\"%s\",\"device\":\"%s\"",
+                event, DEVICE_ID);
+
+    if (wallclock_iso8601(ts, sizeof(ts))) {
+        json_append(buf, size, off, ",\"timestamp\":\"%s\"", ts);
+    }
+}
+
 void telemetry_publish_pump(bool on,
                             const char *reason,
                             float flow_lpm,
                             float distance_cm,
                             bool distance_valid)
 {
-    char payload[224];
+    char   payload[256];
+    size_t off = 0;
 
+    json_open_envelope(payload, sizeof(payload), &off, "pump");
+    json_append(payload, sizeof(payload), &off,
+                ",\"state\":\"%s\",\"reason\":\"%s\",\"flow_lpm\":%.2f",
+                on ? "on" : "off", reason, flow_lpm);
+
+    /* null, not the 0.0 the caller passes for an unusable level: zero
+     * centimetres is a tank filled to the sensor. */
     if (distance_valid) {
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"pump\",\"device\":\"%s\",\"state\":\"%s\","
-                 "\"reason\":\"%s\",\"flow_lpm\":%.2f,\"distance_cm\":%.1f,"
-                 "\"uptime_s\":%lu}",
-                 DEVICE_ID, on ? "on" : "off", reason,
-                 flow_lpm, distance_cm, (unsigned long)uptime_s());
+        json_append(payload, sizeof(payload), &off,
+                    ",\"distance_cm\":%.1f", distance_cm);
     } else {
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"pump\",\"device\":\"%s\",\"state\":\"%s\","
-                 "\"reason\":\"%s\",\"flow_lpm\":%.2f,\"distance_cm\":null,"
-                 "\"uptime_s\":%lu}",
-                 DEVICE_ID, on ? "on" : "off", reason,
-                 flow_lpm, (unsigned long)uptime_s());
+        json_append(payload, sizeof(payload), &off, ",\"distance_cm\":null");
+    }
+
+    json_append(payload, sizeof(payload), &off, ",\"uptime_s\":%lu}",
+                (unsigned long)uptime_s());
+
+    if (off >= sizeof(payload)) {
+        ESP_LOGE(TAG, "pump payload truncated at %u bytes, not published",
+                 (unsigned)sizeof(payload));
+        return;
     }
 
     ESP_LOGI(TAG, "pump event: %s (%s)", on ? "on" : "off", reason);
     publish(TOPIC_PUMP, payload, 1, 1);
 }
 
-/* Neither command is retained. The activator rejects retained commands
- * anyway: a replayed keep_open would hold the valve open with no trial
- * behind it, and a replayed turn_off would shut a trial that has only
- * just started. */
-void telemetry_publish_keep_open(void)
+/* Both commands share the envelope with everything else this controller
+ * publishes; the activator reads the command field and logs the rest.
+ * Neither is retained. The activator rejects retained commands anyway:
+ * a replayed keep_open would hold the valve open with no trial behind
+ * it, and a replayed turn_off would shut a trial that has only just
+ * started. */
+static void publish_command(const char *command, const char *reason)
 {
-    ESP_LOGI(TAG, "keep_open -> %s", TOPIC_ACTIVATOR_CMD);
-    publish(TOPIC_ACTIVATOR_CMD, KEEP_OPEN_PAYLOAD, 1, 0);
+    char   payload[224];
+    size_t off = 0;
+
+    json_open_envelope(payload, sizeof(payload), &off, "command");
+    json_append(payload, sizeof(payload), &off,
+                ",\"command\":\"%s\",\"reason\":\"%s\"", command, reason);
+    json_append(payload, sizeof(payload), &off, ",\"uptime_s\":%lu}",
+                (unsigned long)uptime_s());
+
+    if (off >= sizeof(payload)) {
+        ESP_LOGE(TAG, "command payload truncated at %u bytes, not published",
+                 (unsigned)sizeof(payload));
+        return;
+    }
+
+    ESP_LOGI(TAG, "%s (%s) -> %s", command, reason, TOPIC_ACTIVATOR_CMD);
+    publish(TOPIC_ACTIVATOR_CMD, payload, 1, 0);
 }
 
-void telemetry_publish_turn_off(void)
+void telemetry_publish_keep_open(const char *reason)
 {
-    ESP_LOGI(TAG, "turn_off -> %s", TOPIC_ACTIVATOR_CMD);
-    publish(TOPIC_ACTIVATOR_CMD, TURN_OFF_PAYLOAD, 1, 0);
+    publish_command("keep_open", reason);
+}
+
+void telemetry_publish_turn_off(const char *reason)
+{
+    publish_command("turn_off", reason);
 }
 
 bool telemetry_level_get(float *out_cm)
@@ -133,6 +198,15 @@ bool telemetry_level_get(float *out_cm)
     return true;
 }
 
+/* Parses one level message. The shape it expects is fixed by
+ * MQTT_CONTRACT.md and is what tank-node publishes:
+ *
+ *   {"event":"level","device":"tank-01","timestamp":"...",
+ *    "valid":true,"distance_cm":62.5,"uptime_s":360}
+ *
+ * Anything that fails a check here is recorded as an invalid level,
+ * which the control loop treats as a sensor fault. It is never recorded
+ * as room in the tank. */
 static void handle_level_message(const char *data, int len)
 {
     char buf[256];
@@ -150,8 +224,24 @@ static void handle_level_message(const char *data, int len)
         return;
     }
 
-    const cJSON *valid = cJSON_GetObjectItemCaseSensitive(root, "valid");
-    const cJSON *dist  = cJSON_GetObjectItemCaseSensitive(root, "distance_cm");
+    const cJSON *event  = cJSON_GetObjectItemCaseSensitive(root, "event");
+    const cJSON *device = cJSON_GetObjectItemCaseSensitive(root, "device");
+    const cJSON *valid  = cJSON_GetObjectItemCaseSensitive(root, "valid");
+    const cJSON *dist   = cJSON_GetObjectItemCaseSensitive(root, "distance_cm");
+
+    /* The envelope identifies the message before its fields are read.
+     * A payload that is not a level, or is somebody else's level, tells
+     * us nothing about this tank. */
+    if (!cJSON_IsString(event) || strcmp(event->valuestring, "level") != 0) {
+        ESP_LOGW(TAG, "payload on level topic is not a level event");
+        cJSON_Delete(root);
+        return;
+    }
+    if (!cJSON_IsString(device) || strcmp(device->valuestring, TANK_ID) != 0) {
+        ESP_LOGW(TAG, "level from unexpected device, rejected");
+        cJSON_Delete(root);
+        return;
+    }
 
     bool  ok = cJSON_IsTrue(valid) && cJSON_IsNumber(dist);
     float cm = ok ? (float)dist->valuedouble : 0.0f;
@@ -171,8 +261,12 @@ static void handle_level_message(const char *data, int len)
     portEXIT_CRITICAL(&s_level_mux);
 
     if (!ok) {
-        ESP_LOGW(TAG, "tank node reports level invalid");
+        const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+        ESP_LOGW(TAG, "tank node reports level invalid (%s)",
+                 cJSON_IsString(reason) ? reason->valuestring : "no reason");
     }
+
+    cJSON_Delete(root);
 }
 
 /* ======================= event handlers ======================= */

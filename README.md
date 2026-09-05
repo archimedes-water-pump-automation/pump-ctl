@@ -88,41 +88,66 @@ Requires ESP-IDF v5.x.
 
 ## MQTT contract
 
-Shared with `tank-node`. Changing either side requires changing both.
+Defined in [MQTT_CONTRACT.md](MQTT_CONTRACT.md), which is mirrored in every
+repository of this system. This controller shares the level topic with
+`tank-node` and `archimedes-server`, the pump topic with `archimedes-server`,
+and the command topic with `scheduled-valve`; changing a field means changing
+it on both sides of that topic.
 
 **Subscribes** to `watertank/tank-01/level` — QoS 0, not retained:
 
 ```json
-{"event":"level","device":"tank-01","distance_cm":62.5,
- "valid":true,"uptime_s":360}
+{"event":"level","device":"tank-01","timestamp":"2026-09-05T03:10:12Z",
+ "valid":true,"distance_cm":62.5,"uptime_s":360}
 ```
 
 `distance_cm` is measured from the sensor face downward, so it *decreases* as
-the tank fills. `valid:false` (with `distance_cm: null`) means the tank node
-could not read its sensor, or the broker delivered its last will.
+the tank fills. A message is accepted only if its `event` is `level`, its
+`device` is the configured `TANK_ID`, its `valid` is true, and its
+`distance_cm` is a number inside `DIST_MIN_VALID_CM`–`DIST_MAX_VALID_CM`.
+Everything else — `valid:false` with `distance_cm: null` from an unreadable
+sensor or the node's last will, a reading from another tank, a payload that
+is not a level — counts as a sensor fault, never as room in the tank.
 
 **Publishes** to `watertank/pump-01/pump` — QoS 1, retained, one message per
 pump transition:
 
 ```json
-{"event":"pump","device":"pump-01","state":"on","reason":"flow_confirmed",
- "flow_lpm":11.40,"distance_cm":62.5,"uptime_s":338}
+{"event":"pump","device":"pump-01","timestamp":"2026-09-05T03:10:12Z",
+ "state":"on","reason":"flow_confirmed","flow_lpm":11.40,
+ "distance_cm":62.5,"uptime_s":338}
 ```
 
-Last will on the same topic sets `"state":"unknown"` so a dashboard cannot
-show `on` indefinitely for a controller that has lost power.
+`state` is `on` or `off`, and `reason` carries the transition that caused it —
+`archimedes-server` opens a pump run on `on` and closes it on `off`, storing
+`reason` as the stop reason. `distance_cm` is `null` when no valid level was
+available, never `0`.
+
+The last will on the same topic sets `"state":"unknown"` so a dashboard cannot
+show `on` indefinitely for a controller that has lost power. It carries no
+`timestamp` and no `uptime_s`: the broker publishes it long after this
+controller wrote it. The server logs it and stores nothing — an unreachable
+controller is not a stopped pump, and inventing a stop time would put a
+fabricated run in the history.
 
 **Publishes** to `watertank/activator-01/cmd` — QoS 1, **not retained**:
 
 ```json
-{"command":"keep_open"}       {"command":"turn_off"}
+{"event":"command","device":"pump-01","timestamp":"2026-09-05T03:10:12Z",
+ "command":"keep_open","reason":"flow_confirmed","uptime_s":338}
+```
+
+```json
+{"event":"command","device":"pump-01","timestamp":"2026-09-05T03:14:41Z",
+ "command":"turn_off","reason":"tank_full","uptime_s":607}
 ```
 
 Shared with [`scheduled-valve`](../scheduled-valve), which owns that topic.
 That module opens the supply valve on its own schedule and shuts it again
 unless a `keep_open` reaches it inside its trial window
 (`KEEP_OPEN_WINDOW_MS`, two minutes by default); once held, it stays open
-until `turn_off` or its own `MAX_HOLD_MS` guard.
+until `turn_off` or its own `MAX_HOLD_MS` guard. It reads the `command` field
+and logs the rest.
 
 | Event | Sent when | Ordering |
 |---|---|---|
@@ -142,6 +167,11 @@ Never publish either retained. Each event authorises one specific moment; a
 retained copy replays on every reconnect and would act with nothing behind it.
 The activator rejects retained commands for the same reason.
 
+**Timestamps.** Every published event carries a UTC `timestamp` once SNTP has
+landed. The board has no battery-backed RTC, so until then the field is simply
+absent and the server falls back to its own receipt time — stamping events
+1970 would be worse than not stamping them. The clock never gates the relay.
+
 ## Configuration
 
 All tunables are in `main/config.h`.
@@ -153,6 +183,8 @@ All tunables are in `main/config.h`.
 | `FLOW_PULSES_PER_LITRE` | 450.0 | YF-S201 nominal; calibrate per unit |
 | `FLOW_MIN_LPM` | 0.8 | Below this the pipeline counts as dry |
 | `LEVEL_STALE_MS` | 20000 | Four missed tank-node publishes |
+| `TANK_ID` | tank-01 | Tank node followed; checked against each reading's `device` |
+| `SNTP_SERVER` | pool.ntp.org | Source of the UTC `timestamp` field |
 | `MIN_OFF_MS` | 30000 | Anti short-cycling |
 | `MAX_RUN_MS` | 30 min | Runaway cutoff |
 

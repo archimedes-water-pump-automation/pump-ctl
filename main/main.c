@@ -3,6 +3,7 @@
 
 #include "control.h"
 #include "telemetry.h"
+#include "wallclock.h"
 
 static const char *TAG = "main";
 
@@ -20,6 +21,12 @@ void app_main(void)
      * loop does not wait on it. A broker that never answers costs us
      * log lines, not pump behaviour. */
     telemetry_start();
+
+    /* After the network is up, and never waited on: an unsynced clock
+     * costs the timestamp field on published events, not pump
+     * behaviour. */
+    wallclock_start();
+
     control_start();
 
     ESP_LOGI(TAG, "boot complete");
