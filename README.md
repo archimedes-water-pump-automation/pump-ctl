@@ -158,6 +158,13 @@ pump transition:
 `reason` as the stop reason. `tank_state` is the tank node's last word when
 the relay moved, carried for diagnosis.
 
+On its first connection after a restart the controller publishes the state the
+relay is actually in, with `reason: "boot"`. The topic is retained, so without
+it a restart leaves the last pre-restart message standing — `"on"`, possibly,
+for a pump that is now off — and a run the server opened before the crash has
+nothing to close it. Only the first connection: a reconnect mid-run would
+republish a start that already happened.
+
 The last will on the same topic sets `"state":"unknown"` so a dashboard cannot
 show `on` indefinitely for a controller that has lost power. It carries no
 `timestamp` and no `uptime_s`: the broker publishes it long after this

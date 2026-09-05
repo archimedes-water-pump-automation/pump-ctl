@@ -170,8 +170,23 @@ Last will:
  "reason":"controller_offline"}
 ```
 
+On its first connection after a restart, `pump-ctl` publishes the state its
+relay is actually in with `reason: "boot"`, correcting a retained message left
+over from before the restart and closing a run the server had open when the
+controller died. Only the first connection: a reconnect mid-run would
+republish a start that already happened.
+
 `archimedes-server` maps `state: "on"` to the start of a pump run and
 `state: "off"` to the end of one, storing `reason` as the run's stop reason.
+A `"off"` for a pump with no open run records nothing rather than rewriting
+the last completed run.
+
+**`archimedes-server` ignores retained messages**, on this topic and every
+other. Retention exists for dashboards: the server connects with a clean
+session, so the broker replays the retained pump event on every reconnect, and
+processing it again would record a second run for a start that happened once.
+The cost is that a server starting mid-run does not learn the pump is running
+until its next transition.
 `state: "unknown"` is logged and ignored: the last will says the controller
 is unreachable, not that the pump stopped, and inventing a stop time for it
 would put a fabricated run in the history.
@@ -224,6 +239,11 @@ what the activator did.
 | `state` | string | yes | `"open"`, `"closed"`, or `"unknown"` (last will only). |
 | `reason` | string | yes | `"scheduled_trial"`, `"keep_open"`, `"trial_timeout"`, `"turn_off"`, `"max_hold"`, `"boot"`, or `"controller_offline"` in the last will. |
 | `local_time` | string | no | `"HH:MM"` on the activator's own clock, `"--:--"` before SNTP lands. Human-facing; the machine-readable time is `timestamp`. |
+
+On its first connection after a restart, `scheduled-valve` publishes the state
+its relay is actually in with `reason: "boot"` — a reboot while holding leaves
+the valve closed, because the relay de-energises on power loss, and the
+retained message would otherwise still read `"open"`.
 
 ```json
 {"event":"valve","device":"activator-01","timestamp":"2026-09-05T06:10:00Z",

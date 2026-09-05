@@ -46,6 +46,17 @@ void telemetry_publish_keep_open(const char *reason);
  * two stops it was. */
 void telemetry_publish_turn_off(const char *reason);
 
+/* True exactly once, on the first cycle after the broker connection
+ * comes up for the first time since boot.
+ *
+ * The pump topic is retained, so between a restart and the next pump
+ * transition it holds whatever this controller last published — "on",
+ * possibly, for a pump that is now off. The caller answers by publishing
+ * the state the relay is actually in. Only the first connection: a
+ * reconnect mid-run would otherwise republish a start the server has
+ * already recorded. */
+bool telemetry_take_first_connect(void);
+
 /* Latest tank state received over MQTT.
  *
  * Writes TANK_UNKNOWN and returns false when nothing has arrived, the

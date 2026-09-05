@@ -21,6 +21,12 @@ static const char *TAG = "telemetry";
 static esp_mqtt_client_handle_t s_client;
 static volatile bool            s_connected;
 
+/* Set by the MQTT task on the first connection since boot, taken by the
+ * control task. */
+static portMUX_TYPE  s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool          s_first_connect_pending;
+static bool          s_first_connect_seen;
+
 /* Written by the MQTT task, read by the control task. */
 static portMUX_TYPE  s_tank_mux = portMUX_INITIALIZER_UNLOCKED;
 static tank_state_t  s_tank_state;
@@ -41,6 +47,18 @@ static const char *LWT_PAYLOAD =
 bool telemetry_online(void)
 {
     return s_connected;
+}
+
+bool telemetry_take_first_connect(void)
+{
+    bool taken;
+
+    portENTER_CRITICAL(&s_conn_mux);
+    taken = s_first_connect_pending;
+    s_first_connect_pending = false;
+    portEXIT_CRITICAL(&s_conn_mux);
+
+    return taken;
 }
 
 static uint32_t uptime_s(void)
@@ -290,6 +308,13 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
             s_connected = true;
             esp_mqtt_client_subscribe(s_client, TOPIC_FULL_TANK, 0);
             ESP_LOGI(TAG, "broker connected, subscribed to %s", TOPIC_FULL_TANK);
+
+            portENTER_CRITICAL(&s_conn_mux);
+            if (!s_first_connect_seen) {
+                s_first_connect_seen    = true;
+                s_first_connect_pending = true;
+            }
+            portEXIT_CRITICAL(&s_conn_mux);
             break;
         case MQTT_EVENT_DISCONNECTED:
             s_connected = false;

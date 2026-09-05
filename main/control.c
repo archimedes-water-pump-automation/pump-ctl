@@ -116,6 +116,16 @@ static void control_task(void *arg)
             flow_ok_since = 0;
         }
 
+        /* First time the broker is reachable since boot, say what the
+         * relay is actually doing. The pump topic is retained, so until
+         * this goes out it still holds whatever was published before the
+         * restart, and a run the server opened before a crash has
+         * nothing to close it. */
+        if (telemetry_take_first_connect()) {
+            ESP_LOGI(TAG, "announcing boot state: pump %s", pump_on ? "on" : "off");
+            telemetry_publish_pump(pump_on, "boot", lpm, tank);
+        }
+
         pump_state_t next = state;
 
         /* Set alongside a stop reason that means the pipeline is no
